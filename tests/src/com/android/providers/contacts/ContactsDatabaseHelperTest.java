@@ -18,6 +18,7 @@ package com.android.providers.contacts;
 
 import android.content.ContentValues;
 import android.database.ContentObserver;
+import android.accounts.Account;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.net.Uri;
@@ -126,6 +127,31 @@ public class ContactsDatabaseHelperTest extends BaseContactsProvider2Test {
         assertEquals(
                 mDbHelper.getOrCreateAccountIdInTransaction(a5),
                 mDbHelper.getOrCreateAccountIdInTransaction(a5b));
+    }
+
+    public void testGetOrCreateAccountId_originalLocalAccount() {
+        AccountWithDataSet originalLocalAccount = new AccountWithDataSet("Phone", "Local", null);
+        mDbHelper.setOriginalLocalAccount(originalLocalAccount);
+
+        Long idNewLocal = mDbHelper.getOrCreateAccountIdInTransaction(AccountWithDataSet.LOCAL);
+
+        assertEquals(idNewLocal, mDbHelper.getAccountIdOrNull(originalLocalAccount));
+
+        // Remove all accounts.
+        mDbHelper.getWritableDatabase().execSQL("delete from " + Tables.ACCOUNTS);
+
+        // This is created as the new local account.
+        Long idOriginalLocal = mDbHelper.getOrCreateAccountIdInTransaction(originalLocalAccount);
+        try (Cursor cursor = mDbHelper.getReadableDatabase().query(Tables.ACCOUNTS, new String[]{
+                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_NAME,
+                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_TYPE
+        }, null, null, null, null, null)) {
+            assertTrue(cursor.moveToFirst());
+            assertNull(cursor.getString(0));
+            assertNull(cursor.getString(1));
+        }
+
+        assertEquals(idOriginalLocal, mDbHelper.getAccountIdOrNull(AccountWithDataSet.LOCAL));
     }
 
     /**
@@ -507,5 +533,29 @@ public class ContactsDatabaseHelperTest extends BaseContactsProvider2Test {
         dbHelper2.getReadableDatabase(); // Open the DB.
 
         assertEquals(creationTime, dbHelper2.getDatabaseCreationTime());
+    }
+
+    public void testGetAndSetDefaultAccount() {
+        Account account = mDbHelper.getDefaultAccount();
+        assertNull(account);
+
+        mDbHelper.setDefaultAccount("a", "b");
+        account = mDbHelper.getDefaultAccount();
+        assertEquals("a", account.name);
+        assertEquals("b", account.type);
+
+        mDbHelper.setDefaultAccount("c", "d");
+        account = mDbHelper.getDefaultAccount();
+        assertEquals("c", account.name);
+        assertEquals("d", account.type);
+
+        mDbHelper.setDefaultAccount(null, null);
+        account = mDbHelper.getDefaultAccount();
+        assertNull(account);
+
+        // invalid account name does nothing.
+        mDbHelper.setDefaultAccount(")--", null);
+        account = mDbHelper.getDefaultAccount();
+        assertNull(account);
     }
 }
