@@ -30,7 +30,6 @@ android_app {
     ],
     static_libs: [
         "android-common",
-        "androidx.annotation_annotation",
         "com.android.vcard",
         "guava",
     ],
@@ -49,4 +48,9 @@ android_app {
     optimize: {
         proguard_flags_files: ["proguard.flags"],
     },
+}
+
+platform_compat_config {
+    name: "contacts-provider-platform-compat-config",
+    src: ":ContactsProvider",
 }

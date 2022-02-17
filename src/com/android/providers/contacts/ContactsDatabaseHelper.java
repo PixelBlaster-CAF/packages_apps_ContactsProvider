@@ -91,11 +91,10 @@ import android.util.Base64;
 import android.util.Log;
 import android.util.Slog;
 
-import androidx.annotation.NonNull;
-import androidx.annotation.VisibleForTesting;
-
 import com.android.common.content.SyncStateContentProviderHelper;
+import com.android.internal.R;
 import com.android.internal.R.bool;
+import com.android.internal.annotations.VisibleForTesting;
 import com.android.providers.contacts.aggregation.util.CommonNicknameCache;
 import com.android.providers.contacts.database.ContactsTableUtil;
 import com.android.providers.contacts.database.DeletedContactsTableUtil;
@@ -106,13 +105,14 @@ import com.android.providers.contacts.sqlite.SqlChecker.InvalidSqlException;
 import com.android.providers.contacts.util.NeededForTesting;
 import com.android.providers.contacts.util.PropertyUtils;
 
+import com.google.common.base.Strings;
+
 import java.io.PrintWriter;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -150,7 +150,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      *   1600-1699 T
      * </pre>
      */
-    static final int DATABASE_VERSION = 1602;
+    static final int DATABASE_VERSION = 1603;
     private static final int MINIMUM_SUPPORTED_VERSION = 700;
 
     @VisibleForTesting
@@ -296,15 +296,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 + "INNER JOIN view_raw_contacts ON (name_lookup.raw_contact_id = "
                 + "view_raw_contacts._id)";
 
-        /**
-         * Used for display name lookup key queries.
-         *
-         * <p>See comment on {@link Views#RAW_CONTACTS_LOOKUP_COMPAT} for more detail.
-         */
-        public static final String NAME_LOOKUP_JOIN_RAW_CONTACTS_LOOKUP_COMPAT = "name_lookup "
-                + "INNER JOIN view_raw_contacts_lookup_compat ON (name_lookup.raw_contact_id = "
-                + "view_raw_contacts_lookup_compat._id)";
-
         public static final String RAW_CONTACTS_JOIN_ACCOUNTS = Tables.RAW_CONTACTS
                 + " JOIN " + Tables.ACCOUNTS + " ON ("
                 + AccountsColumns.CONCRETE_ID + "=" + RawContactsColumns.CONCRETE_ACCOUNT_ID
@@ -339,12 +330,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         public static final String RAW_ENTITIES = "view_raw_entities";
         public static final String GROUPS = "view_groups";
         public static final String SETTINGS = "view_settings";
-        /**
-         * View used for lookup key queries that allows lookup keys created for a custom local
-         * account to continue to resolve to the same contact even though these accounts were
-         * converted to the default AOSP local account.
-         */
-        public static final String RAW_CONTACTS_LOOKUP_COMPAT = "view_raw_contacts_lookup_compat";
 
         /** The data_usage_stat table with the low-res columns. */
         public static final String DATA_USAGE_LR = "view_data_usage";
@@ -373,18 +358,30 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
     }
 
     public interface Clauses {
+
         final String HAVING_NO_GROUPS = "COUNT(" + DataColumns.CONCRETE_GROUP_ID + ") == 0";
 
         final String GROUP_BY_ACCOUNT_CONTACT_ID = AccountsColumns.CONCRETE_ID + ","
                 + RawContacts.CONTACT_ID;
 
         String LOCAL_ACCOUNT_ID =
-                "(SELECT " + AccountsColumns._ID +
-                " FROM " + Tables.ACCOUNTS +
-                " WHERE " +
-                    AccountsColumns.ACCOUNT_NAME + " IS NULL AND " +
-                    AccountsColumns.ACCOUNT_TYPE + " IS NULL AND " +
-                    AccountsColumns.DATA_SET + " IS NULL)";
+                "(SELECT "
+                        + AccountsColumns._ID
+                        + " FROM "
+                        + Tables.ACCOUNTS
+                        + " WHERE "
+                        + AccountsColumns.ACCOUNT_NAME
+                        + " IS "
+                        + MoreDatabaseUtils.sqlEscapeNullableString(
+                                AccountWithDataSet.LOCAL.getAccountName())
+                        + " AND "
+                        + AccountsColumns.ACCOUNT_TYPE
+                        + " IS "
+                        + MoreDatabaseUtils.sqlEscapeNullableString(
+                                AccountWithDataSet.LOCAL.getAccountType())
+                        + " AND "
+                        + AccountsColumns.DATA_SET
+                        + " IS NULL)";
 
         final String ZERO_GROUP_MEMBERSHIPS = "COUNT(" + GroupsColumns.CONCRETE_ID + ")=0";
 
@@ -714,12 +711,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         String CONCRETE_ACCOUNT_TYPE = Tables.ACCOUNTS + "." + ACCOUNT_TYPE;
         String CONCRETE_DATA_SET = Tables.ACCOUNTS + "." + DATA_SET;
 
-        String ACCOUNT_TYPE_AND_DATA_SET =
-                "(CASE WHEN " + AccountsColumns.CONCRETE_DATA_SET + " IS NULL"
-                        + " THEN " + AccountsColumns.CONCRETE_ACCOUNT_TYPE
-                        + " ELSE " + AccountsColumns.CONCRETE_ACCOUNT_TYPE + "||'/'||"
-                            + AccountsColumns.CONCRETE_DATA_SET
-                        + " END)";
     }
 
     public interface DirectoryColumns {
@@ -976,17 +967,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
     private NameSplitter.Name mName = new NameSplitter.Name();
     private CharArrayBuffer mCharArrayBuffer = new CharArrayBuffer(128);
     private NameSplitter mNameSplitter;
-    /**
-     * The account that was used for local contacts on the OS the device was first shipped with.
-     *
-     * <p>Prior to Android T it was common for OEMs to define their own custom local acount types
-     * but this fragmentation was problematic so these were migrated to match the AOSP convention
-     * for the local account. This variable has the "original" OEM specified local account rather
-     * than the current one for use in code that performs the migration and ensures compatibility.
-     *
-     * <p>Note: this is set lazily but is really only mutable for testability.
-     */
-    private AccountWithDataSet mOriginalLocalAccount;
 
     private final Executor mLazilyCreatedExecutor =
             new ThreadPoolExecutor(0, 1, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
@@ -1629,7 +1609,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         createContactsTriggers(db);
         createContactsIndexes(db, false /* we build stats table later */);
         createPresenceTables(db);
-        createLocalAccountCompatViews(db);
 
         loadNicknameLookupTable(db);
 
@@ -1908,8 +1887,11 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 + AccountsColumns.CONCRETE_ACCOUNT_NAME + " AS " + RawContacts.ACCOUNT_NAME + ","
                 + AccountsColumns.CONCRETE_ACCOUNT_TYPE + " AS " + RawContacts.ACCOUNT_TYPE + ","
                 + AccountsColumns.CONCRETE_DATA_SET + " AS " + RawContacts.DATA_SET + ","
-                + AccountsColumns.ACCOUNT_TYPE_AND_DATA_SET + " AS "
-                        + RawContacts.ACCOUNT_TYPE_AND_DATA_SET + ","
+                + "(CASE WHEN " + AccountsColumns.CONCRETE_DATA_SET + " IS NULL THEN "
+                            + AccountsColumns.CONCRETE_ACCOUNT_TYPE
+                        + " ELSE " + AccountsColumns.CONCRETE_ACCOUNT_TYPE + "||'/'||"
+                            + AccountsColumns.CONCRETE_DATA_SET + " END) AS "
+                                + RawContacts.ACCOUNT_TYPE_AND_DATA_SET + ","
                 + RawContactsColumns.CONCRETE_SOURCE_ID + " AS " + RawContacts.SOURCE_ID + ","
                 + RawContactsColumns.CONCRETE_BACKUP_ID + " AS " + RawContacts.BACKUP_ID + ","
                 + RawContactsColumns.CONCRETE_VERSION + " AS " + RawContacts.VERSION + ","
@@ -2246,8 +2228,11 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                 + AccountsColumns.CONCRETE_ACCOUNT_NAME + " AS " + Groups.ACCOUNT_NAME + ","
                 + AccountsColumns.CONCRETE_ACCOUNT_TYPE + " AS " + Groups.ACCOUNT_TYPE + ","
                 + AccountsColumns.CONCRETE_DATA_SET + " AS " + Groups.DATA_SET + ","
-                + AccountsColumns.ACCOUNT_TYPE_AND_DATA_SET
-                        + " AS " + Groups.ACCOUNT_TYPE_AND_DATA_SET + ","
+                + "(CASE WHEN " + AccountsColumns.CONCRETE_DATA_SET
+                    + " IS NULL THEN " + AccountsColumns.CONCRETE_ACCOUNT_TYPE
+                    + " ELSE " + AccountsColumns.CONCRETE_ACCOUNT_TYPE
+                        + "||'/'||" + AccountsColumns.CONCRETE_DATA_SET + " END) AS "
+                            + Groups.ACCOUNT_TYPE_AND_DATA_SET + ","
                 + Groups.SOURCE_ID + ","
                 + Groups.VERSION + ","
                 + Groups.DIRTY + ","
@@ -2306,92 +2291,24 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
                     + AccountsColumns.SHOULD_SYNC + " = NEW." + Settings.SHOULD_SYNC + " "
                 + "WHERE _id = OLD." + ViewSettingsColumns.ACCOUNT_ID + "; "
                 + "END;");
+
         // Unlike other accounts ungrouped contacts in the local account are visible by default and
         // it is not syncable.
+        String localAccountNameSqlLiteral = MoreDatabaseUtils.sqlEscapeNullableString(
+                AccountWithDataSet.LOCAL.getAccountName());
+        String localAccountTypeSqlLiteral = MoreDatabaseUtils.sqlEscapeNullableString(
+                AccountWithDataSet.LOCAL.getAccountType());
         db.execSQL("CREATE TRIGGER " + Tables.ACCOUNTS + "_insert_local_account "
                 + "AFTER INSERT ON " + Tables.ACCOUNTS + " "
-                + "WHEN NEW." + AccountsColumns.ACCOUNT_NAME + " IS NULL AND "
-                    + "NEW." + AccountsColumns.ACCOUNT_TYPE + " IS NULL AND "
-                    + "NEW." + AccountsColumns.DATA_SET + " IS NULL "
+                + "WHEN NEW." + AccountsColumns.ACCOUNT_NAME + " IS " + localAccountNameSqlLiteral
+                + " AND NEW." + AccountsColumns.ACCOUNT_TYPE + " IS " + localAccountTypeSqlLiteral
+                + " AND NEW." + AccountsColumns.DATA_SET + " IS NULL "
                 + "BEGIN UPDATE " + Tables.ACCOUNTS + " SET "
-                    + Settings.UNGROUPED_VISIBLE + " = 1, "
-                    + Settings.SHOULD_SYNC + " = 0 "
+                + Settings.UNGROUPED_VISIBLE + " = 1, "
+                + Settings.SHOULD_SYNC + " = 0 "
                 + "WHERE " + AccountsColumns._ID + " = NEW." + AccountsColumns._ID + "; "
                 + "END;"
         );
-    }
-
-    @VisibleForTesting
-    void createLocalAccountCompatViews(SQLiteDatabase db) {
-        db.execSQL("DROP VIEW IF EXISTS " + Views.RAW_CONTACTS_LOOKUP_COMPAT + ";");
-
-        AccountWithDataSet originalLocalAccount = getOriginalLocalAccount();
-        String localAccountName = originalLocalAccount.getAccountName();
-        String localAccountType = originalLocalAccount.getAccountType();
-        String accountNameSqlLiteral;
-        String accountTypeSqlLiteral;
-        if (TextUtils.isEmpty(localAccountName) || TextUtils.isEmpty(localAccountType)) {
-            accountNameSqlLiteral = "NULL";
-            accountTypeSqlLiteral = "NULL";
-        } else {
-            accountNameSqlLiteral = DatabaseUtils.sqlEscapeString(localAccountName);
-            accountTypeSqlLiteral = DatabaseUtils.sqlEscapeString(localAccountType);
-        }
-
-        // Basically every local raw contact will appear twice in the results; once joined with the
-        // new local name and type (i.e. null) and once with the original name and type. This allows
-        // lookup keys generated with the previous account to continue to function.
-        String lookupCompatSelect = "SELECT "
-                + RawContactsColumns.CONCRETE_ID + ", "
-                + RawContacts.CONTACT_ID + ", "
-                + RawContacts.SOURCE_ID + ", "
-                + AccountsColumns.CONCRETE_ACCOUNT_NAME + ", "
-                + AccountsColumns.ACCOUNT_TYPE_AND_DATA_SET
-                + " FROM " + Tables.RAW_CONTACTS_JOIN_ACCOUNTS
-                + " UNION SELECT "
-                + RawContactsColumns.CONCRETE_ID + ", "
-                + RawContacts.CONTACT_ID + ", "
-                + RawContacts.SOURCE_ID + ", "
-                + accountNameSqlLiteral + ","
-                + accountTypeSqlLiteral
-                + " FROM " + Tables.RAW_CONTACTS
-                + " WHERE " + RawContactsColumns.ACCOUNT_ID  + "=" + Clauses.LOCAL_ACCOUNT_ID;
-
-        db.execSQL(
-                "CREATE VIEW " + Views.RAW_CONTACTS_LOOKUP_COMPAT + "("
-                        + RawContacts._ID + ", "
-                        + RawContacts.CONTACT_ID + ", "
-                        + RawContacts.SOURCE_ID + ", "
-                        + RawContacts.ACCOUNT_NAME + ", "
-                        + RawContacts.ACCOUNT_TYPE_AND_DATA_SET
-                        + ")"
-                        + " AS " + lookupCompatSelect);
-    }
-
-    @NonNull
-    private AccountWithDataSet getOriginalLocalAccount() {
-        if (mOriginalLocalAccount != null) {
-            return mOriginalLocalAccount;
-        }
-        String name = mContext.getString(R.string.config_originalLocalAccountName);
-        String type = mContext.getString(R.string.config_originalLocalAccountType);
-        if (name.isEmpty() || type.isEmpty()) {
-            name = mContext.getString(
-                    com.android.internal.R.string.config_rawContactsLocalAccountName);
-            type = mContext.getString(
-                    com.android.internal.R.string.config_rawContactsLocalAccountType);
-        }
-        if (name.isEmpty() || type.isEmpty()) {
-            mOriginalLocalAccount = AccountWithDataSet.LOCAL;
-        } else {
-            mOriginalLocalAccount = new AccountWithDataSet(name, type, null);
-        }
-        return mOriginalLocalAccount;
-    }
-
-    @VisibleForTesting
-    public void setOriginalLocalAccount(@NonNull AccountWithDataSet localAccount) {
-        this.mOriginalLocalAccount = localAccount;
     }
 
     @Override
@@ -2727,9 +2644,16 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         }
 
         if (isUpgradeRequired(oldVersion, newVersion, 1602)) {
-            upgradeToVersion1602(db);
-            upgradeViewsAndTriggers = true;
+            // 1602 was used for an upgrade that was reverted and is now a no-op. It is safe to skip
+            // it but the database version should not be reused because droidfood devices may have
+            // run the upgrade.
             oldVersion = 1602;
+        }
+
+        if (isUpgradeRequired(oldVersion, newVersion, 1603)) {
+            upgradeToVersion1603(db);
+            upgradeViewsAndTriggers = true;
+            oldVersion = 1603;
         }
 
         // We extracted "calls" and "voicemail_status" at this point, but we can't remove them here
@@ -2741,7 +2665,6 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
             createSettingsView(db);
             createContactsTriggers(db);
             createContactsIndexes(db, false /* we build stats table later */);
-            createLocalAccountCompatViews(db);
             upgradeLegacyApiSupport = true;
             rebuildSqliteStats = true;
         }
@@ -3567,58 +3490,13 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
         }
     }
 
-    private void upgradeToVersion1602(SQLiteDatabase db) {
-        AccountWithDataSet originalLocalAccount = getOriginalLocalAccount();
-
-        if (Objects.equals(AccountWithDataSet.LOCAL, originalLocalAccount)) {
-            // Nothing to do.
-            return;
+    private void upgradeToVersion1603(SQLiteDatabase db) {
+        try {
+            // Drop the view that was created in 1602 which was reverted
+            db.execSQL("DROP VIEW IF EXISTS view_raw_contacts_lookup_compat");
+        } catch (SQLException ignore) {
+            Log.v(TAG, "Version 1603: failed to remove view_raw_contacts_lookup_compat.");
         }
-        String localName = originalLocalAccount.getAccountName();
-        String localType = originalLocalAccount.getAccountType();
-        // Change the custom local account if there is one to be to be consistent with the AOSP
-        // convention of using NULL.
-        ContentValues values = new ContentValues();
-        values.putNull("account_name");
-        values.putNull("account_type");
-        int count = db.update("accounts", values,
-                "((account_name ISNULL AND account_type ISNULL)"
-                        + " OR (account_name = ? AND account_type = ?))"
-                        + " AND data_set IS NULL",
-                new String[] {
-                        localName,
-                        localType,
-                });
-        if (count <= 1) {
-            // Only 1 local account so nothing left to do. This should pretty much always be true
-            // given how local accounts usually work
-            return;
-        }
-        // Else: the original local account was coexisting with the AOSP local account so try to
-        // clean up by consolidating them. The one with the higher account ID will be migrated to
-        // the one with the lower ID
-        long migrateTo;
-        long migrateFrom;
-        try (Cursor cursor = db.query(
-                "accounts",
-                new String[] { "_id" },
-                "account_name ISNULL AND account_type ISNULL AND data_set ISNULL",
-                null, null, null, "_id ASC")) {
-            if (cursor == null || cursor.getCount() != 2) {
-                return;
-            }
-            cursor.moveToFirst();
-            migrateTo = cursor.getLong(0);
-            cursor.moveToNext();
-            migrateFrom = cursor.getLong(0);
-        }
-
-        values.clear();
-        values.put("account_id", migrateTo);
-        String selection = "account_id = " + migrateFrom;
-        db.update("raw_contacts", values, selection, null);
-        db.update("groups", values, selection, null);
-        db.delete("accounts", "_id = " + migrateFrom, null);
     }
 
     /**
@@ -4187,8 +4065,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      * @return ID of the specified account, or null if the account doesn't exist.
      */
     public Long getAccountIdOrNull(AccountWithDataSet accountWithDataSet) {
-        if (accountWithDataSet == null
-                || Objects.equals(getOriginalLocalAccount(), accountWithDataSet)) {
+        if (accountWithDataSet == null) {
             accountWithDataSet = AccountWithDataSet.LOCAL;
         }
         final SQLiteStatement select = getWritableDatabase().compileStatement(
@@ -4222,8 +4099,7 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      * This must be used in a transaction, so there's no need for synchronization.
      */
     public long getOrCreateAccountIdInTransaction(AccountWithDataSet accountWithDataSet) {
-        if (accountWithDataSet == null
-                || Objects.equals(getOriginalLocalAccount(), accountWithDataSet)) {
+        if (accountWithDataSet == null) {
             accountWithDataSet = AccountWithDataSet.LOCAL;
         }
         Long id = getAccountIdOrNull(accountWithDataSet);
@@ -4314,23 +4190,32 @@ public class ContactsDatabaseHelper extends SQLiteOpenHelper {
      *
      * @param accountName The account name to be set to default.
      * @param accountType The account type to be set to default.
+     * @throws IllegalArgumentException if the account name or type is null.
      */
     public void setDefaultAccount(String accountName, String accountType) {
+        if (TextUtils.isEmpty(accountName) ^ TextUtils.isEmpty(accountType)) {
+            throw new IllegalArgumentException("Account name or type is null.");
+        }
         SQLiteDatabase db = getWritableDatabase();
         db.execSQL(
-            "UPDATE " + Tables.ACCOUNTS +
-                " SET " + AccountsColumns.IS_DEFAULT + "=0" +
-                " WHERE " + AccountsColumns.IS_DEFAULT + "=1");
+                "UPDATE " + Tables.ACCOUNTS +
+                        " SET " + AccountsColumns.IS_DEFAULT + "=0" +
+                        " WHERE " + AccountsColumns.IS_DEFAULT + "=1");
 
+        Long accountId = getAccountIdOrNull(new AccountWithDataSet(accountName, accountType, null));
         ContentValues values = new ContentValues();
-        if (!TextUtils.isEmpty(accountName)) {
-            values.put(AccountsColumns.ACCOUNT_NAME, accountName);
-        }
-        if (!TextUtils.isEmpty(accountType)) {
-            values.put(AccountsColumns.ACCOUNT_TYPE, accountType);
-        }
         values.put(AccountsColumns.IS_DEFAULT, 1);
-        db.insertWithOnConflict(Tables.ACCOUNTS, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+        if (accountId == null) {
+            if (!TextUtils.isEmpty(accountName)) {
+                values.put(AccountsColumns.ACCOUNT_NAME, accountName);
+            }
+            if (!TextUtils.isEmpty(accountType)) {
+                values.put(AccountsColumns.ACCOUNT_TYPE, accountType);
+            }
+            db.insert(Tables.ACCOUNTS, null, values);
+        } else {
+            db.update(Tables.ACCOUNTS, values, AccountsColumns.CONCRETE_ID + "=" + accountId, null);
+        }
     }
 
     /**

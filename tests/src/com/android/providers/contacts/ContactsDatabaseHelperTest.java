@@ -129,31 +129,6 @@ public class ContactsDatabaseHelperTest extends BaseContactsProvider2Test {
                 mDbHelper.getOrCreateAccountIdInTransaction(a5b));
     }
 
-    public void testGetOrCreateAccountId_originalLocalAccount() {
-        AccountWithDataSet originalLocalAccount = new AccountWithDataSet("Phone", "Local", null);
-        mDbHelper.setOriginalLocalAccount(originalLocalAccount);
-
-        Long idNewLocal = mDbHelper.getOrCreateAccountIdInTransaction(AccountWithDataSet.LOCAL);
-
-        assertEquals(idNewLocal, mDbHelper.getAccountIdOrNull(originalLocalAccount));
-
-        // Remove all accounts.
-        mDbHelper.getWritableDatabase().execSQL("delete from " + Tables.ACCOUNTS);
-
-        // This is created as the new local account.
-        Long idOriginalLocal = mDbHelper.getOrCreateAccountIdInTransaction(originalLocalAccount);
-        try (Cursor cursor = mDbHelper.getReadableDatabase().query(Tables.ACCOUNTS, new String[]{
-                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_NAME,
-                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_TYPE
-        }, null, null, null, null, null)) {
-            assertTrue(cursor.moveToFirst());
-            assertNull(cursor.getString(0));
-            assertNull(cursor.getString(1));
-        }
-
-        assertEquals(idOriginalLocal, mDbHelper.getAccountIdOrNull(AccountWithDataSet.LOCAL));
-    }
-
     /**
      * Test for {@link ContactsDatabaseHelper#queryIdWithOneArg} and
      * {@link ContactsDatabaseHelper#insertWithOneArgAndReturnId}.
@@ -553,9 +528,27 @@ public class ContactsDatabaseHelperTest extends BaseContactsProvider2Test {
         account = mDbHelper.getDefaultAccount();
         assertNull(account);
 
-        // invalid account name does nothing.
-        mDbHelper.setDefaultAccount(")--", null);
+        // Invalid account (not-null account name and null account type) throws exception.
+        try {
+            mDbHelper.setDefaultAccount("name", null);
+            fail("Setting default account to an invalid account should fail.");
+        } catch (IllegalArgumentException e) {
+            // expected.
+        }
         account = mDbHelper.getDefaultAccount();
         assertNull(account);
+
+        // Update default account to an existing account
+        mDbHelper.setDefaultAccount("a", "b");
+        account = mDbHelper.getDefaultAccount();
+        assertEquals("a", account.name);
+        assertEquals("b", account.type);
+
+        try (Cursor cursor = mDbHelper.getReadableDatabase().query(Tables.ACCOUNTS, new String[]{
+                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_NAME,
+                ContactsDatabaseHelper.AccountsColumns.ACCOUNT_TYPE
+        }, null, null, null, null, null)) {
+            assertEquals(3, cursor.getCount());
+        }
     }
 }
